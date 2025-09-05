@@ -11,10 +11,14 @@
 (define-constant err-trial-not-active (err u105))
 (define-constant err-patient-exists (err u106))
 (define-constant err-invalid-status (err u107))
+(define-constant err-insufficient-funds (err u108))
+(define-constant err-reward-already-claimed (err u109))
+(define-constant err-no-rewards-available (err u110))
 
 (define-data-var next-trial-id uint u1)
 (define-data-var next-patient-id uint u1)
 (define-data-var next-data-entry-id uint u1)
+(define-data-var next-reward-pool-id uint u1)
 
 (define-map trials
     uint
@@ -71,6 +75,40 @@
     }
 )
 
+(define-map reward-pools
+    uint
+    {
+        trial-id: uint,
+        total-amount: uint,
+        remaining-amount: uint,
+        enrollment-reward: uint,
+        data-submission-reward: uint,
+        verification-reward: uint,
+        created-by: principal,
+        created-at: uint,
+        active: bool
+    }
+)
+
+(define-map participant-rewards
+    { trial-id: uint, participant: principal }
+    {
+        enrollment-claimed: bool,
+        data-submissions: uint,
+        data-rewards-claimed: uint,
+        total-earned: uint
+    }
+)
+
+(define-map verifier-rewards
+    { trial-id: uint, verifier: principal }
+    {
+        verifications-completed: uint,
+        rewards-claimed: uint,
+        total-earned: uint
+    }
+)
+
 (define-read-only (get-trial (trial-id uint))
     (map-get? trials trial-id)
 )
@@ -101,6 +139,18 @@
 
 (define-read-only (get-current-data-entry-id)
     (var-get next-data-entry-id)
+)
+
+(define-read-only (get-reward-pool (pool-id uint))
+    (map-get? reward-pools pool-id)
+)
+
+(define-read-only (get-participant-rewards (trial-id uint) (participant principal))
+    (map-get? participant-rewards { trial-id: trial-id, participant: participant })
+)
+
+(define-read-only (get-verifier-rewards (trial-id uint) (verifier principal))
+    (map-get? verifier-rewards { trial-id: trial-id, verifier: verifier })
 )
 
 (define-private (is-authorized (trial-id uint) (user principal))
@@ -198,6 +248,14 @@
             }
         )
         
+        (map-set participant-rewards
+            { trial-id: trial-id, participant: tx-sender }
+            (merge (default-to 
+                { enrollment-claimed: false, data-submissions: u0, data-rewards-claimed: u0, total-earned: u0 }
+                (map-get? participant-rewards { trial-id: trial-id, participant: tx-sender })
+            ) { data-submissions: u0 })
+        )
+        
         (map-set trials trial-id
             (merge trial { patient-count: (+ (get patient-count trial) u1) })
         )
@@ -243,6 +301,19 @@
             (merge trial { data-entries: (+ (get data-entries trial) u1) })
         )
         
+        (let
+            (
+                (current-rewards (default-to 
+                    { enrollment-claimed: false, data-submissions: u0, data-rewards-claimed: u0, total-earned: u0 }
+                    (map-get? participant-rewards { trial-id: (get trial-id patient), participant: tx-sender })
+                ))
+            )
+            (map-set participant-rewards
+                { trial-id: (get trial-id patient), participant: tx-sender }
+                (merge current-rewards { data-submissions: (+ (get data-submissions current-rewards) u1) })
+            )
+        )
+        
         (var-set next-data-entry-id (+ data-id u1))
         (ok data-id)
     )
@@ -279,6 +350,19 @@
                 verification-hash: verification-hash,
                 notes: notes
             }
+        )
+        
+        (let
+            (
+                (current-verifier-rewards (default-to 
+                    { verifications-completed: u0, rewards-claimed: u0, total-earned: u0 }
+                    (map-get? verifier-rewards { trial-id: (get trial-id patient), verifier: tx-sender })
+                ))
+            )
+            (map-set verifier-rewards
+                { trial-id: (get trial-id patient), verifier: tx-sender }
+                (merge current-verifier-rewards { verifications-completed: (+ (get verifications-completed current-verifier-rewards) u1) })
+            )
         )
         
         (ok true)
@@ -518,6 +602,285 @@
         total-trials: (- (var-get next-trial-id) u1),
         total-patients: (- (var-get next-patient-id) u1),
         total-data-entries: (- (var-get next-data-entry-id) u1),
+        total-reward-pools: (- (var-get next-reward-pool-id) u1),
         contract-owner: contract-owner
     })
+)
+
+(define-public (create-reward-pool
+    (trial-id uint)
+    (enrollment-reward uint)
+    (data-submission-reward uint)
+    (verification-reward uint)
+)
+    (let
+        (
+            (pool-id (var-get next-reward-pool-id))
+            (trial (unwrap! (map-get? trials trial-id) err-not-found))
+            (total-amount (+ enrollment-reward (+ data-submission-reward verification-reward)))
+        )
+        (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
+        (asserts! (> total-amount u0) err-invalid-data)
+        
+        (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set reward-pools pool-id
+            {
+                trial-id: trial-id,
+                total-amount: total-amount,
+                remaining-amount: total-amount,
+                enrollment-reward: enrollment-reward,
+                data-submission-reward: data-submission-reward,
+                verification-reward: verification-reward,
+                created-by: tx-sender,
+                created-at: stacks-block-height,
+                active: true
+            }
+        )
+        
+        (var-set next-reward-pool-id (+ pool-id u1))
+        (ok pool-id)
+    )
+)
+
+(define-public (fund-reward-pool (pool-id uint) (additional-amount uint))
+    (let
+        (
+            (pool (unwrap! (map-get? reward-pools pool-id) err-not-found))
+            (trial (unwrap! (map-get? trials (get trial-id pool)) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
+        (asserts! (get active pool) err-invalid-data)
+        (asserts! (> additional-amount u0) err-invalid-data)
+        
+        (try! (stx-transfer? additional-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set reward-pools pool-id
+            (merge pool 
+                { 
+                    total-amount: (+ (get total-amount pool) additional-amount),
+                    remaining-amount: (+ (get remaining-amount pool) additional-amount)
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (claim-enrollment-reward (trial-id uint))
+    (let
+        (
+            (pool (unwrap! (get-trial-reward-pool trial-id) err-not-found))
+            (existing-rewards (default-to 
+                { enrollment-claimed: false, data-submissions: u0, data-rewards-claimed: u0, total-earned: u0 }
+                (map-get? participant-rewards { trial-id: trial-id, participant: tx-sender })
+            ))
+        )
+        (asserts! (get active pool) err-invalid-data)
+        (asserts! (not (get enrollment-claimed existing-rewards)) err-reward-already-claimed)
+        (asserts! (is-patient-in-trial trial-id tx-sender) err-unauthorized)
+        (asserts! (>= (get remaining-amount pool) (get enrollment-reward pool)) err-insufficient-funds)
+        
+        (try! (as-contract (stx-transfer? (get enrollment-reward pool) tx-sender (get created-by pool))))
+        
+        (let
+            (
+                (pool-id (unwrap! (get-pool-id-by-trial trial-id) err-not-found))
+            )
+            (map-set reward-pools pool-id
+                (merge pool { remaining-amount: (- (get remaining-amount pool) (get enrollment-reward pool)) })
+            )
+        )
+        
+        (map-set participant-rewards 
+            { trial-id: trial-id, participant: tx-sender }
+            (merge existing-rewards 
+                { 
+                    enrollment-claimed: true,
+                    total-earned: (+ (get total-earned existing-rewards) (get enrollment-reward pool))
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (claim-data-submission-reward (trial-id uint))
+    (let
+        (
+            (pool (unwrap! (get-trial-reward-pool trial-id) err-not-found))
+            (existing-rewards (default-to 
+                { enrollment-claimed: false, data-submissions: u0, data-rewards-claimed: u0, total-earned: u0 }
+                (map-get? participant-rewards { trial-id: trial-id, participant: tx-sender })
+            ))
+            (unclaimed-submissions (- (get data-submissions existing-rewards) (get data-rewards-claimed existing-rewards)))
+            (reward-amount (* unclaimed-submissions (get data-submission-reward pool)))
+        )
+        (asserts! (get active pool) err-invalid-data)
+        (asserts! (> unclaimed-submissions u0) err-no-rewards-available)
+        (asserts! (>= (get remaining-amount pool) reward-amount) err-insufficient-funds)
+        
+        (try! (as-contract (stx-transfer? reward-amount tx-sender (get created-by pool))))
+        
+        (let
+            (
+                (pool-id (unwrap! (get-pool-id-by-trial trial-id) err-not-found))
+            )
+            (map-set reward-pools pool-id
+                (merge pool { remaining-amount: (- (get remaining-amount pool) reward-amount) })
+            )
+        )
+        
+        (map-set participant-rewards 
+            { trial-id: trial-id, participant: tx-sender }
+            (merge existing-rewards 
+                { 
+                    data-rewards-claimed: (get data-submissions existing-rewards),
+                    total-earned: (+ (get total-earned existing-rewards) reward-amount)
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (claim-verification-reward (trial-id uint))
+    (let
+        (
+            (pool (unwrap! (get-trial-reward-pool trial-id) err-not-found))
+            (existing-rewards (default-to 
+                { verifications-completed: u0, rewards-claimed: u0, total-earned: u0 }
+                (map-get? verifier-rewards { trial-id: trial-id, verifier: tx-sender })
+            ))
+            (unclaimed-verifications (- (get verifications-completed existing-rewards) (get rewards-claimed existing-rewards)))
+            (reward-amount (* unclaimed-verifications (get verification-reward pool)))
+        )
+        (asserts! (get active pool) err-invalid-data)
+        (asserts! (> unclaimed-verifications u0) err-no-rewards-available)
+        (asserts! (>= (get remaining-amount pool) reward-amount) err-insufficient-funds)
+        
+        (try! (as-contract (stx-transfer? reward-amount tx-sender (get created-by pool))))
+        
+        (let
+            (
+                (pool-id (unwrap! (get-pool-id-by-trial trial-id) err-not-found))
+            )
+            (map-set reward-pools pool-id
+                (merge pool { remaining-amount: (- (get remaining-amount pool) reward-amount) })
+            )
+        )
+        
+        (map-set verifier-rewards 
+            { trial-id: trial-id, verifier: tx-sender }
+            (merge existing-rewards 
+                { 
+                    rewards-claimed: (get verifications-completed existing-rewards),
+                    total-earned: (+ (get total-earned existing-rewards) reward-amount)
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (deactivate-reward-pool (pool-id uint))
+    (let
+        (
+            (pool (unwrap! (map-get? reward-pools pool-id) err-not-found))
+            (trial (unwrap! (map-get? trials (get trial-id pool)) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
+        (asserts! (get active pool) err-invalid-data)
+        
+        (try! (as-contract (stx-transfer? (get remaining-amount pool) tx-sender (get created-by pool))))
+        
+        (map-set reward-pools pool-id
+            (merge pool { active: false, remaining-amount: u0 })
+        )
+        (ok true)
+    )
+)
+
+(define-private (get-trial-reward-pool (trial-id uint))
+    (match (get-pool-id-by-trial trial-id)
+        pool-id (map-get? reward-pools pool-id)
+        none
+    )
+)
+
+(define-private (get-pool-id-by-trial (target-trial-id uint))
+    (get result (fold check-pool-match (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) 
+          { target: target-trial-id, result: none }))
+)
+
+(define-private (check-pool-match 
+    (pool-id uint) 
+    (state { target: uint, result: (optional uint) })
+)
+    (match (get result state)
+        found-id state
+        (match (map-get? reward-pools pool-id)
+            pool (if (is-eq (get trial-id pool) (get target state)) 
+                    (merge state { result: (some pool-id) })
+                    state)
+            state
+        )
+    )
+)
+
+(define-private (is-patient-in-trial (trial-id uint) (user principal))
+    (is-some (fold check-patient-in-trial (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) none))
+)
+
+(define-private (check-patient-in-trial (patient-id uint) (acc (optional bool)))
+    (match acc
+        found (some found)
+        (match (map-get? patients patient-id)
+            patient (if (is-eq (get registered-by patient) tx-sender) 
+                        (some true) 
+                        none)
+            none
+        )
+    )
+)
+
+(define-read-only (get-reward-pool-stats (trial-id uint))
+    (match (get-trial-reward-pool trial-id)
+        pool (ok {
+            total-amount: (get total-amount pool),
+            remaining-amount: (get remaining-amount pool),
+            enrollment-reward: (get enrollment-reward pool),
+            data-submission-reward: (get data-submission-reward pool),
+            verification-reward: (get verification-reward pool),
+            active: (get active pool)
+        })
+        err-not-found
+    )
+)
+
+(define-read-only (calculate-available-rewards (trial-id uint) (user principal))
+    (let
+        (
+            (pool (unwrap! (get-trial-reward-pool trial-id) err-not-found))
+            (participant-reward-data (default-to 
+                { enrollment-claimed: false, data-submissions: u0, data-rewards-claimed: u0, total-earned: u0 }
+                (map-get? participant-rewards { trial-id: trial-id, participant: user })
+            ))
+            (verifier-reward-data (default-to 
+                { verifications-completed: u0, rewards-claimed: u0, total-earned: u0 }
+                (map-get? verifier-rewards { trial-id: trial-id, verifier: user })
+            ))
+        )
+        (ok {
+            enrollment-available: (if (get enrollment-claimed participant-reward-data) u0 (get enrollment-reward pool)),
+            data-rewards-available: (* 
+                (- (get data-submissions participant-reward-data) (get data-rewards-claimed participant-reward-data))
+                (get data-submission-reward pool)
+            ),
+            verification-rewards-available: (* 
+                (- (get verifications-completed verifier-reward-data) (get rewards-claimed verifier-reward-data))
+                (get verification-reward pool)
+            )
+        })
+    )
 )
