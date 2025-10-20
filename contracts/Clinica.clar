@@ -20,6 +20,28 @@
 (define-data-var next-data-entry-id uint u1)
 (define-data-var next-reward-pool-id uint u1)
 
+(define-map checkpoint-configs
+    { trial-id: uint }
+    {
+        interval-blocks: uint,
+        verification-threshold: uint
+    }
+)
+
+(define-map audit-checkpoints
+    { checkpoint-id: uint }
+    {
+        trial-id: uint,
+        block-created: uint,
+        verified-count: uint,
+        total-count: uint,
+        passed: bool,
+        verifier: principal
+    }
+)
+
+(define-data-var next-checkpoint-id uint u0)
+
 (define-map trials
     uint
     {
@@ -882,5 +904,130 @@
                 (get verification-reward pool)
             )
         })
+    )
+)
+
+(define-public (configure-audit-checkpoint (trial-id uint) (interval-blocks uint) (verification-threshold uint))
+    (let
+        (
+            (trial (unwrap! (map-get? trials trial-id) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
+        (asserts! (> interval-blocks u0) err-invalid-data)
+        (asserts! (<= verification-threshold u100) err-invalid-data)
+        (map-set checkpoint-configs
+            { trial-id: trial-id }
+            {
+                interval-blocks: interval-blocks,
+                verification-threshold: verification-threshold
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (create-audit-checkpoint (trial-id uint))
+    (let
+        (
+            (trial (unwrap! (map-get? trials trial-id) err-not-found))
+            (config (unwrap! (map-get? checkpoint-configs { trial-id: trial-id }) err-not-found))
+            (checkpoint-id (var-get next-checkpoint-id))
+            (verified-count (get data-entries trial))
+            (total-count (get data-entries trial))
+            (verification-rate (if (is-eq total-count u0) u100 (/ (* verified-count u100) total-count)))
+            (passed (>= verification-rate (get verification-threshold config)))
+        )
+        (map-set audit-checkpoints
+            { checkpoint-id: checkpoint-id }
+            {
+                trial-id: trial-id,
+                block-created: stacks-block-height,
+                verified-count: verified-count,
+                total-count: total-count,
+                passed: passed,
+                verifier: tx-sender
+            }
+        )
+        (var-set next-checkpoint-id (+ checkpoint-id u1))
+        (ok checkpoint-id)
+    )
+)
+
+(define-public (skip-audit-checkpoint (trial-id uint))
+    (let
+        (
+            (trial (unwrap! (map-get? trials trial-id) err-not-found))
+            (checkpoint-id (var-get next-checkpoint-id))
+        )
+        (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
+        (map-set audit-checkpoints
+            { checkpoint-id: checkpoint-id }
+            {
+                trial-id: trial-id,
+                block-created: stacks-block-height,
+                verified-count: u0,
+                total-count: u0,
+                passed: true,
+                verifier: tx-sender
+            }
+        )
+        (var-set next-checkpoint-id (+ checkpoint-id u1))
+        (ok checkpoint-id)
+    )
+)
+
+(define-read-only (get-checkpoint-config (trial-id uint))
+    (map-get? checkpoint-configs { trial-id: trial-id })
+)
+
+(define-read-only (get-audit-checkpoint (checkpoint-id uint))
+    (map-get? audit-checkpoints { checkpoint-id: checkpoint-id })
+)
+
+(define-read-only (get-trial-compliance-status (trial-id uint))
+    (let
+        (
+            (config (map-get? checkpoint-configs { trial-id: trial-id }))
+            (current-id (var-get next-checkpoint-id))
+        )
+        (if (is-some config)
+            (let
+                (
+                    (last-checkpoint (if (> current-id u0) (map-get? audit-checkpoints { checkpoint-id: (- current-id u1) }) none))
+                )
+                (ok {
+                    config: config,
+                    last-checkpoint: last-checkpoint,
+                    next-audit-block: (if (is-some last-checkpoint)
+                        (some (+ (get block-created (unwrap-panic last-checkpoint)) (get interval-blocks (unwrap-panic config))))
+                        none
+                    )
+                })
+            )
+            (err u101)
+        )
+    )
+)
+
+(define-read-only (is-trial-compliant (trial-id uint))
+    (let
+        (
+            (current-id (var-get next-checkpoint-id))
+        )
+        (if (> current-id u0)
+            (let
+                (
+                    (last-checkpoint (map-get? audit-checkpoints { checkpoint-id: (- current-id u1) }))
+                )
+                (if (is-some last-checkpoint)
+                    (if (is-eq trial-id (get trial-id (unwrap-panic last-checkpoint)))
+                        (ok (get passed (unwrap-panic last-checkpoint)))
+                        (ok true)
+                    )
+                    (ok true)
+                )
+            )
+            (ok true)
+        )
     )
 )
