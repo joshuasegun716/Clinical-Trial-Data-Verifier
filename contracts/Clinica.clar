@@ -1,6 +1,6 @@
 ;; title: Clinica
-;; version: 1.0.0
-;; summary: Clinical Trial Data Verifier - ensuring data integrity and transparency
+;; version: 2.0.0
+;; summary: Clinical Trial Data Verifier - ensuring data integrity and transparency with multi-signature approval gates
 
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
@@ -14,6 +14,10 @@
 (define-constant err-insufficient-funds (err u108))
 (define-constant err-reward-already-claimed (err u109))
 (define-constant err-no-rewards-available (err u110))
+(define-constant err-multi-sig-required (err u111))
+(define-constant err-approver-already-signed (err u112))
+(define-constant err-invalid-threshold (err u113))
+(define-constant err-not-approver (err u114))
 
 (define-data-var next-trial-id uint u1)
 (define-data-var next-patient-id uint u1)
@@ -131,6 +135,44 @@
     }
 )
 
+(define-map multi-sig-configs
+    { trial-id: uint }
+    {
+        threshold: uint,
+        max-approvers: uint,
+        active: bool
+    }
+)
+
+(define-map trial-approvers
+    { trial-id: uint, approver: principal }
+    {
+        active: bool,
+        added-at: uint
+    }
+)
+
+(define-map approver-counts
+    { trial-id: uint }
+    {
+        count: uint
+    }
+)
+
+(define-map data-signatures
+    { data-id: uint, approver: principal }
+    {
+        signed-at: uint
+    }
+)
+
+(define-map signature-counts
+    { data-id: uint }
+    {
+        count: uint
+    }
+)
+
 (define-read-only (get-trial (trial-id uint))
     (map-get? trials trial-id)
 )
@@ -176,7 +218,7 @@
 )
 
 (define-private (is-authorized (trial-id uint) (user principal))
-    (or 
+    (or
         (is-eq user contract-owner)
         (is-some (map-get? trial-permissions { trial-id: trial-id, user: user }))
     )
@@ -189,7 +231,7 @@
     )
 )
 
-(define-public (create-trial 
+(define-public (create-trial
     (title (string-ascii 100))
     (institution (string-ascii 100))
     (duration-blocks uint)
@@ -202,7 +244,7 @@
         (asserts! (> (len title) u0) err-invalid-data)
         (asserts! (> (len institution) u0) err-invalid-data)
         (asserts! (> duration-blocks u0) err-invalid-data)
-        
+
         (map-set trials trial-id
             {
                 title: title,
@@ -215,18 +257,18 @@
                 data-entries: u0
             }
         )
-        
-        (map-set trial-permissions 
+
+        (map-set trial-permissions
             { trial-id: trial-id, user: tx-sender }
             { role: "admin", granted-at: current-block }
         )
-        
+
         (var-set next-trial-id (+ trial-id u1))
         (ok trial-id)
     )
 )
 
-(define-public (grant-permission 
+(define-public (grant-permission
     (trial-id uint)
     (user principal)
     (role (string-ascii 20))
@@ -237,8 +279,8 @@
         )
         (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
         (asserts! (or (is-eq role "researcher") (is-eq role "admin")) err-invalid-data)
-        
-        (map-set trial-permissions 
+
+        (map-set trial-permissions
             { trial-id: trial-id, user: user }
             { role: role, granted-at: stacks-block-height }
         )
@@ -258,7 +300,7 @@
         (asserts! (is-authorized trial-id tx-sender) err-unauthorized)
         (asserts! (is-trial-active trial-id) err-trial-not-active)
         (asserts! (> (len patient-identifier) u0) err-invalid-data)
-        
+
         (map-set patients patient-id
             {
                 trial-id: trial-id,
@@ -269,19 +311,19 @@
                 data-entries: u0
             }
         )
-        
+
         (map-set participant-rewards
             { trial-id: trial-id, participant: tx-sender }
-            (merge (default-to 
+            (merge (default-to
                 { enrollment-claimed: false, data-submissions: u0, data-rewards-claimed: u0, total-earned: u0 }
                 (map-get? participant-rewards { trial-id: trial-id, participant: tx-sender })
             ) { data-submissions: u0 })
         )
-        
+
         (map-set trials trial-id
             (merge trial { patient-count: (+ (get patient-count trial) u1) })
         )
-        
+
         (var-set next-patient-id (+ patient-id u1))
         (ok patient-id)
     )
@@ -302,7 +344,7 @@
         (asserts! (is-trial-active (get trial-id patient)) err-trial-not-active)
         (asserts! (> (len data-type) u0) err-invalid-data)
         (asserts! (> (len data-hash) u0) err-invalid-data)
-        
+
         (map-set patient-data data-id
             {
                 patient-id: patient-id,
@@ -314,18 +356,18 @@
                 verified-by: none
             }
         )
-        
+
         (map-set patients patient-id
             (merge patient { data-entries: (+ (get data-entries patient) u1) })
         )
-        
+
         (map-set trials (get trial-id patient)
             (merge trial { data-entries: (+ (get data-entries trial) u1) })
         )
-        
+
         (let
             (
-                (current-rewards (default-to 
+                (current-rewards (default-to
                     { enrollment-claimed: false, data-submissions: u0, data-rewards-claimed: u0, total-earned: u0 }
                     (map-get? participant-rewards { trial-id: (get trial-id patient), participant: tx-sender })
                 ))
@@ -335,7 +377,7 @@
                 (merge current-rewards { data-submissions: (+ (get data-submissions current-rewards) u1) })
             )
         )
-        
+
         (var-set next-data-entry-id (+ data-id u1))
         (ok data-id)
     )
@@ -350,44 +392,46 @@
         (
             (data-entry (unwrap! (map-get? patient-data data-id) err-not-found))
             (patient (unwrap! (map-get? patients (get patient-id data-entry)) err-not-found))
+            (config (map-get? multi-sig-configs { trial-id: (get trial-id patient) }))
         )
         (asserts! (is-authorized (get trial-id patient) tx-sender) err-unauthorized)
         (asserts! (not (get verified data-entry)) err-invalid-data)
         (asserts! (> (len verification-hash) u0) err-invalid-data)
-        
-        (map-set patient-data data-id
-            (merge data-entry 
-                { 
-                    verified: true, 
-                    verified-by: (some tx-sender) 
-                }
+        (if (and (is-some config) (get active (unwrap-panic config)))
+            err-multi-sig-required
+            (begin
+                (map-set patient-data data-id
+                    (merge data-entry
+                        {
+                            verified: true,
+                            verified-by: (some tx-sender)
+                        }
+                    )
+                )
+                (map-set data-verification data-id
+                    {
+                        data-id: data-id,
+                        verifier: tx-sender,
+                        verified-at: stacks-block-height,
+                        verification-hash: verification-hash,
+                        notes: notes
+                    }
+                )
+                (let
+                    (
+                        (current-verifier-rewards (default-to
+                            { verifications-completed: u0, rewards-claimed: u0, total-earned: u0 }
+                            (map-get? verifier-rewards { trial-id: (get trial-id patient), verifier: tx-sender })
+                        ))
+                    )
+                    (map-set verifier-rewards
+                        { trial-id: (get trial-id patient), verifier: tx-sender }
+                        (merge current-verifier-rewards { verifications-completed: (+ (get verifications-completed current-verifier-rewards) u1) })
+                    )
+                )
+                (ok true)
             )
         )
-        
-        (map-set data-verification data-id
-            {
-                data-id: data-id,
-                verifier: tx-sender,
-                verified-at: stacks-block-height,
-                verification-hash: verification-hash,
-                notes: notes
-            }
-        )
-        
-        (let
-            (
-                (current-verifier-rewards (default-to 
-                    { verifications-completed: u0, rewards-claimed: u0, total-earned: u0 }
-                    (map-get? verifier-rewards { trial-id: (get trial-id patient), verifier: tx-sender })
-                ))
-            )
-            (map-set verifier-rewards
-                { trial-id: (get trial-id patient), verifier: tx-sender }
-                (merge current-verifier-rewards { verifications-completed: (+ (get verifications-completed current-verifier-rewards) u1) })
-            )
-        )
-        
-        (ok true)
     )
 )
 
@@ -400,13 +444,13 @@
             (trial (unwrap! (map-get? trials trial-id) err-not-found))
         )
         (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
-        (asserts! (or 
+        (asserts! (or
             (is-eq new-status "active")
             (is-eq new-status "paused")
             (is-eq new-status "completed")
             (is-eq new-status "terminated")
         ) err-invalid-status)
-        
+
         (map-set trials trial-id
             (merge trial { status: new-status })
         )
@@ -423,13 +467,13 @@
             (patient (unwrap! (map-get? patients patient-id) err-not-found))
         )
         (asserts! (is-authorized (get trial-id patient) tx-sender) err-unauthorized)
-        (asserts! (or 
+        (asserts! (or
             (is-eq new-status "enrolled")
             (is-eq new-status "active")
             (is-eq new-status "completed")
             (is-eq new-status "withdrawn")
         ) err-invalid-status)
-        
+
         (map-set patients patient-id
             (merge patient { status: new-status })
         )
@@ -519,11 +563,11 @@
         (
             (trial (unwrap! (map-get? trials trial-id) err-not-found))
         )
-        (asserts! (or 
+        (asserts! (or
             (is-eq tx-sender contract-owner)
             (is-eq tx-sender (get principal-investigator trial))
         ) err-unauthorized)
-        
+
         (map-set trials trial-id
             (merge trial { status: "paused" })
         )
@@ -537,7 +581,7 @@
             start-block: (get start-block trial),
             end-block: (get end-block trial),
             current-block: stacks-block-height,
-            progress-percentage: (/ (* (- stacks-block-height (get start-block trial)) u100) 
+            progress-percentage: (/ (* (- stacks-block-height (get start-block trial)) u100)
                                    (- (get end-block trial) (get start-block trial)))
         })
         err-not-found
@@ -551,7 +595,7 @@
         )
         (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
         (asserts! (> additional-blocks u0) err-invalid-data)
-        
+
         (map-set trials trial-id
             (merge trial { end-block: (+ (get end-block trial) additional-blocks) })
         )
@@ -568,7 +612,7 @@
 
 (define-private (collect-unverified (data-id uint) (acc (list 10 uint)))
     (match (map-get? patient-data data-id)
-        data-entry (if (not (get verified data-entry)) 
+        data-entry (if (not (get verified data-entry))
                       (unwrap-panic (as-max-len? (append acc data-id) u10))
                       acc)
         acc
@@ -611,7 +655,7 @@
         )
         (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
         (asserts! (>= stacks-block-height (get end-block trial)) err-invalid-data)
-        
+
         (map-set trials trial-id
             (merge trial { status: "completed" })
         )
@@ -643,9 +687,9 @@
         )
         (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
         (asserts! (> total-amount u0) err-invalid-data)
-        
+
         (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
-        
+
         (map-set reward-pools pool-id
             {
                 trial-id: trial-id,
@@ -659,7 +703,7 @@
                 active: true
             }
         )
-        
+
         (var-set next-reward-pool-id (+ pool-id u1))
         (ok pool-id)
     )
@@ -674,12 +718,12 @@
         (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
         (asserts! (get active pool) err-invalid-data)
         (asserts! (> additional-amount u0) err-invalid-data)
-        
+
         (try! (stx-transfer? additional-amount tx-sender (as-contract tx-sender)))
-        
+
         (map-set reward-pools pool-id
-            (merge pool 
-                { 
+            (merge pool
+                {
                     total-amount: (+ (get total-amount pool) additional-amount),
                     remaining-amount: (+ (get remaining-amount pool) additional-amount)
                 }
@@ -693,7 +737,7 @@
     (let
         (
             (pool (unwrap! (get-trial-reward-pool trial-id) err-not-found))
-            (existing-rewards (default-to 
+            (existing-rewards (default-to
                 { enrollment-claimed: false, data-submissions: u0, data-rewards-claimed: u0, total-earned: u0 }
                 (map-get? participant-rewards { trial-id: trial-id, participant: tx-sender })
             ))
@@ -702,9 +746,9 @@
         (asserts! (not (get enrollment-claimed existing-rewards)) err-reward-already-claimed)
         (asserts! (is-patient-in-trial trial-id tx-sender) err-unauthorized)
         (asserts! (>= (get remaining-amount pool) (get enrollment-reward pool)) err-insufficient-funds)
-        
+
         (try! (as-contract (stx-transfer? (get enrollment-reward pool) tx-sender (get created-by pool))))
-        
+
         (let
             (
                 (pool-id (unwrap! (get-pool-id-by-trial trial-id) err-not-found))
@@ -713,11 +757,11 @@
                 (merge pool { remaining-amount: (- (get remaining-amount pool) (get enrollment-reward pool)) })
             )
         )
-        
-        (map-set participant-rewards 
+
+        (map-set participant-rewards
             { trial-id: trial-id, participant: tx-sender }
-            (merge existing-rewards 
-                { 
+            (merge existing-rewards
+                {
                     enrollment-claimed: true,
                     total-earned: (+ (get total-earned existing-rewards) (get enrollment-reward pool))
                 }
@@ -731,7 +775,7 @@
     (let
         (
             (pool (unwrap! (get-trial-reward-pool trial-id) err-not-found))
-            (existing-rewards (default-to 
+            (existing-rewards (default-to
                 { enrollment-claimed: false, data-submissions: u0, data-rewards-claimed: u0, total-earned: u0 }
                 (map-get? participant-rewards { trial-id: trial-id, participant: tx-sender })
             ))
@@ -741,9 +785,9 @@
         (asserts! (get active pool) err-invalid-data)
         (asserts! (> unclaimed-submissions u0) err-no-rewards-available)
         (asserts! (>= (get remaining-amount pool) reward-amount) err-insufficient-funds)
-        
+
         (try! (as-contract (stx-transfer? reward-amount tx-sender (get created-by pool))))
-        
+
         (let
             (
                 (pool-id (unwrap! (get-pool-id-by-trial trial-id) err-not-found))
@@ -752,11 +796,11 @@
                 (merge pool { remaining-amount: (- (get remaining-amount pool) reward-amount) })
             )
         )
-        
-        (map-set participant-rewards 
+
+        (map-set participant-rewards
             { trial-id: trial-id, participant: tx-sender }
-            (merge existing-rewards 
-                { 
+            (merge existing-rewards
+                {
                     data-rewards-claimed: (get data-submissions existing-rewards),
                     total-earned: (+ (get total-earned existing-rewards) reward-amount)
                 }
@@ -770,7 +814,7 @@
     (let
         (
             (pool (unwrap! (get-trial-reward-pool trial-id) err-not-found))
-            (existing-rewards (default-to 
+            (existing-rewards (default-to
                 { verifications-completed: u0, rewards-claimed: u0, total-earned: u0 }
                 (map-get? verifier-rewards { trial-id: trial-id, verifier: tx-sender })
             ))
@@ -780,9 +824,9 @@
         (asserts! (get active pool) err-invalid-data)
         (asserts! (> unclaimed-verifications u0) err-no-rewards-available)
         (asserts! (>= (get remaining-amount pool) reward-amount) err-insufficient-funds)
-        
+
         (try! (as-contract (stx-transfer? reward-amount tx-sender (get created-by pool))))
-        
+
         (let
             (
                 (pool-id (unwrap! (get-pool-id-by-trial trial-id) err-not-found))
@@ -791,11 +835,11 @@
                 (merge pool { remaining-amount: (- (get remaining-amount pool) reward-amount) })
             )
         )
-        
-        (map-set verifier-rewards 
+
+        (map-set verifier-rewards
             { trial-id: trial-id, verifier: tx-sender }
-            (merge existing-rewards 
-                { 
+            (merge existing-rewards
+                {
                     rewards-claimed: (get verifications-completed existing-rewards),
                     total-earned: (+ (get total-earned existing-rewards) reward-amount)
                 }
@@ -813,9 +857,9 @@
         )
         (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
         (asserts! (get active pool) err-invalid-data)
-        
+
         (try! (as-contract (stx-transfer? (get remaining-amount pool) tx-sender (get created-by pool))))
-        
+
         (map-set reward-pools pool-id
             (merge pool { active: false, remaining-amount: u0 })
         )
@@ -831,18 +875,18 @@
 )
 
 (define-private (get-pool-id-by-trial (target-trial-id uint))
-    (get result (fold check-pool-match (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) 
+    (get result (fold check-pool-match (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
           { target: target-trial-id, result: none }))
 )
 
-(define-private (check-pool-match 
-    (pool-id uint) 
+(define-private (check-pool-match
+    (pool-id uint)
     (state { target: uint, result: (optional uint) })
 )
     (match (get result state)
         found-id state
         (match (map-get? reward-pools pool-id)
-            pool (if (is-eq (get trial-id pool) (get target state)) 
+            pool (if (is-eq (get trial-id pool) (get target state))
                     (merge state { result: (some pool-id) })
                     state)
             state
@@ -858,8 +902,8 @@
     (match acc
         found (some found)
         (match (map-get? patients patient-id)
-            patient (if (is-eq (get registered-by patient) tx-sender) 
-                        (some true) 
+            patient (if (is-eq (get registered-by patient) tx-sender)
+                        (some true)
                         none)
             none
         )
@@ -884,26 +928,173 @@
     (let
         (
             (pool (unwrap! (get-trial-reward-pool trial-id) err-not-found))
-            (participant-reward-data (default-to 
+            (participant-reward-data (default-to
                 { enrollment-claimed: false, data-submissions: u0, data-rewards-claimed: u0, total-earned: u0 }
                 (map-get? participant-rewards { trial-id: trial-id, participant: user })
             ))
-            (verifier-reward-data (default-to 
+            (verifier-reward-data (default-to
                 { verifications-completed: u0, rewards-claimed: u0, total-earned: u0 }
                 (map-get? verifier-rewards { trial-id: trial-id, verifier: user })
             ))
         )
         (ok {
             enrollment-available: (if (get enrollment-claimed participant-reward-data) u0 (get enrollment-reward pool)),
-            data-rewards-available: (* 
+            data-rewards-available: (*
                 (- (get data-submissions participant-reward-data) (get data-rewards-claimed participant-reward-data))
                 (get data-submission-reward pool)
             ),
-            verification-rewards-available: (* 
+            verification-rewards-available: (*
                 (- (get verifications-completed verifier-reward-data) (get rewards-claimed verifier-reward-data))
                 (get verification-reward pool)
             )
         })
+    )
+)
+
+(define-public (configure-multi-sig (trial-id uint) (threshold uint) (max-approvers uint))
+    (let
+        (
+            (trial (unwrap! (map-get? trials trial-id) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
+        (asserts! (> threshold u0) err-invalid-threshold)
+        (asserts! (> max-approvers u0) err-invalid-data)
+        (asserts! (<= threshold max-approvers) err-invalid-threshold)
+        (map-set multi-sig-configs { trial-id: trial-id } { threshold: threshold, max-approvers: max-approvers, active: true })
+        (map-set approver-counts { trial-id: trial-id } { count: u0 })
+        (ok true)
+    )
+)
+
+(define-public (add-approver (trial-id uint) (approver principal))
+    (let
+        (
+            (trial (unwrap! (map-get? trials trial-id) err-not-found))
+            (config (unwrap! (map-get? multi-sig-configs { trial-id: trial-id }) err-not-found))
+            (count-row (default-to { count: u0 } (map-get? approver-counts { trial-id: trial-id })))
+        )
+        (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
+        (asserts! (get active config) err-invalid-data)
+        (asserts! (< (get count count-row) (get max-approvers config)) err-invalid-data)
+        (map-set trial-approvers { trial-id: trial-id, approver: approver } { active: true, added-at: stacks-block-height })
+        (map-set approver-counts { trial-id: trial-id } { count: (+ (get count count-row) u1) })
+        (ok true)
+    )
+)
+
+(define-public (remove-approver (trial-id uint) (approver principal))
+    (let
+        (
+            (trial (unwrap! (map-get? trials trial-id) err-not-found))
+            (config (unwrap! (map-get? multi-sig-configs { trial-id: trial-id }) err-not-found))
+            (count-row (default-to { count: u0 } (map-get? approver-counts { trial-id: trial-id })))
+            (existing (map-get? trial-approvers { trial-id: trial-id, approver: approver }))
+        )
+        (asserts! (is-eq tx-sender (get principal-investigator trial)) err-unauthorized)
+        (asserts! (get active config) err-invalid-data)
+        (if (is-some existing)
+            (begin
+                (map-set trial-approvers { trial-id: trial-id, approver: approver } { active: false, added-at: (get added-at (unwrap-panic existing)) })
+                (map-set approver-counts { trial-id: trial-id } { count: (if (> (get count count-row) u0) (- (get count count-row) u1) u0) })
+                (ok true)
+            )
+            (ok false)
+        )
+    )
+)
+
+(define-public (submit-multi-sig-approval (data-id uint) (verification-hash (buff 32)) (notes (string-ascii 200)))
+    (let
+        (
+            (data-entry (unwrap! (map-get? patient-data data-id) err-not-found))
+            (patient (unwrap! (map-get? patients (get patient-id data-entry)) err-not-found))
+            (trial-id (get trial-id patient))
+            (config (unwrap! (map-get? multi-sig-configs { trial-id: trial-id }) err-multi-sig-required))
+            (approver (map-get? trial-approvers { trial-id: trial-id, approver: tx-sender }))
+            (count-row (default-to { count: u0 } (map-get? signature-counts { data-id: data-id })))
+            (already (map-get? data-signatures { data-id: data-id, approver: tx-sender }))
+        )
+        (asserts! (get active config) err-invalid-data)
+        (asserts! (is-some approver) err-not-approver)
+        (asserts! (get active (unwrap-panic approver)) err-not-approver)
+        (asserts! (not (get verified data-entry)) err-invalid-data)
+        (asserts! (> (len verification-hash) u0) err-invalid-data)
+        (asserts! (is-none already) err-approver-already-signed)
+        (map-set data-signatures { data-id: data-id, approver: tx-sender } { signed-at: stacks-block-height })
+        (map-set signature-counts { data-id: data-id } { count: (+ (get count count-row) u1) })
+        (let ((new-count (+ (get count count-row) u1)))
+            (if (>= new-count (get threshold config))
+                (begin
+                    (map-set patient-data data-id (merge data-entry { verified: true, verified-by: (some tx-sender) }))
+                    (map-set data-verification data-id { data-id: data-id, verifier: tx-sender, verified-at: stacks-block-height, verification-hash: verification-hash, notes: notes })
+                    (let ((current-verifier-rewards (default-to { verifications-completed: u0, rewards-claimed: u0, total-earned: u0 } (map-get? verifier-rewards { trial-id: trial-id, verifier: tx-sender }))))
+                        (map-set verifier-rewards { trial-id: trial-id, verifier: tx-sender } (merge current-verifier-rewards { verifications-completed: (+ (get verifications-completed current-verifier-rewards) u1) }))
+                    )
+                    (ok new-count)
+                )
+                (begin
+                    (let ((current-verifier-rewards (default-to { verifications-completed: u0, rewards-claimed: u0, total-earned: u0 } (map-get? verifier-rewards { trial-id: trial-id, verifier: tx-sender }))))
+                        (map-set verifier-rewards { trial-id: trial-id, verifier: tx-sender } (merge current-verifier-rewards { verifications-completed: (+ (get verifications-completed current-verifier-rewards) u1) }))
+                    )
+                    (ok new-count)
+                )
+            )
+        )
+    )
+)
+
+(define-read-only (get-multi-sig-config (trial-id uint))
+    (map-get? multi-sig-configs { trial-id: trial-id })
+)
+
+(define-read-only (get-signature-count (data-id uint))
+    (get count (default-to { count: u0 } (map-get? signature-counts { data-id: data-id })))
+)
+
+(define-read-only (has-approver-signed (data-id uint) (approver principal))
+    (is-some (map-get? data-signatures { data-id: data-id, approver: approver }))
+)
+
+(define-read-only (is-multi-sig-verified (data-id uint))
+    (match (map-get? patient-data data-id)
+        data-entry (let
+            (
+                (patient (unwrap! (map-get? patients (get patient-id data-entry)) err-not-found))
+                (config (map-get? multi-sig-configs { trial-id: (get trial-id patient) }))
+                (count-row (default-to { count: u0 } (map-get? signature-counts { data-id: data-id })))
+            )
+            (if (and (is-some config) (get active (unwrap-panic config)))
+                (ok (>= (get count count-row) (get threshold (unwrap-panic config))))
+                (ok (get verified data-entry))
+            )
+        )
+        err-not-found
+    )
+)
+
+(define-read-only (get-pending-approvals (trial-id uint))
+    (get result (fold collect-pending (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) { target: trial-id, result: (list) }))
+)
+
+(define-private (collect-pending (data-id uint) (state { target: uint, result: (list 10 uint) }))
+    (match (map-get? patient-data data-id)
+        data-entry (let
+            (
+                (patient-opt (map-get? patients (get patient-id data-entry)))
+                (config-opt (map-get? multi-sig-configs { trial-id: (get target state) }))
+                (count-row (default-to { count: u0 } (map-get? signature-counts { data-id: data-id })))
+            )
+            (if (and (is-some patient-opt)
+                     (is-some config-opt)
+                     (get active (unwrap-panic config-opt))
+                     (is-eq (get trial-id (unwrap-panic patient-opt)) (get target state))
+                     (not (get verified data-entry))
+                     (< (get count count-row) (get threshold (unwrap-panic config-opt))))
+                (merge state { result: (unwrap-panic (as-max-len? (append (get result state) data-id) u10)) })
+                state
+            )
+        )
+        state
     )
 )
 
